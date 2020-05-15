@@ -10,7 +10,10 @@ class MemEvent(object):
         self.is_write = is_write
         self.is_migration = is_migration
         self.current_cycle = current_cycle
-
+class SwapPolicy(Enum):
+    FastSwap = 0
+    SlowSwap = 1
+    SmartSwap = 2
 
 addr_bit = 48
 addr_page_low = 12
@@ -22,6 +25,7 @@ addr_region_bit = 4
 addr_set_low = addr_region_low + addr_region_bit
 addr_set_bit = addr_bit - addr_set_low
 INF = 1000000000
+c_trans_cache_capacity_per_set = 4
 
 class Memory(TimingObj):
     def __init__(self, capacity, read_lat, write_lat):
@@ -29,6 +33,7 @@ class Memory(TimingObj):
         self.read_lat = read_lat
         self.write_lat = write_lat
     def request(self, event):
+        # print("addr:%x capacity:%x" % (event.m_addr, self.capacity))
         if event.m_addr > self.capacity:
             return -1 # out of memory exception
         if event.is_write:
@@ -81,6 +86,7 @@ class FlatMemory(TimingObj):
 
     def sync_cycle(self):
         self.avail_cycle = max(self.fastmem.avail_cycle, self.slowmem.avail_cycle)
+        self.fastmem.avail_cycle = self.slowmem.avail_cycle = self.avail_cycle # we take a serialization timing model so far
 
     def advance_cycle(self, is_fastmem, cycle):
         if is_fastmem:
@@ -92,7 +98,7 @@ class FlatMemory(TimingObj):
     def request(self, event):
         event.m_addr = self.translate_address(event.p_addr)
         in_fast = self.maddr_in_fastmem(event.m_addr)
-        self.advance_cycle(True, self.trans_table_read_lat) # advance fastmem avail_cycle. trans_table always in fastmem
+        # self.advance_cycle(True, self.trans_table_read_lat) # advance fastmem avail_cycle. trans_table always in fastmem TODO: need to modify
         if not event.is_migration:
             print("granted access %x -> %x in_fast %x" % (event.p_addr, event.m_addr, in_fast))
         if in_fast:
@@ -116,10 +122,22 @@ class MetaCache(TimingObj):
         self.flatmem = flatmem
 
     entries = {} # region_id -> hotness
+    cached_trans_table = [] # we do not actually duplicate transtable. Use a bool array to cancel latency for cached mapping.
     def track_hotness(self, event):
         self.timestamp += 1
         p_region = extract_bit(event.p_addr, addr_region_low, addr_region_bit)
         self.entries[p_region] = CacheEntry(self.timestamp) # we use timestamp LRU to track hotness
+
+    def access_trans_cache(self, p_addr):
+        p_page = extract_bit(p_addr, addr_page_low, addr_page_bit)
+        if not p_page in self.cached_trans_table:
+            self.flatmem.advance_cycle(True, self.flatmem.trans_table_read_lat) # if miss, add translation latency
+            self.flatmem.sync_cycle()
+            self.cached_trans_table.append(p_page)
+            if len(self.cached_trans_table) > c_trans_cache_capacity_per_set:
+                self.cached_trans_table.pop()
+        # if hit, no latency added
+        return self.flatmem.translate_address(p_addr)
 
     def find_victim(self, event):
         min_hotness = INF
@@ -135,18 +153,20 @@ class MetaCache(TimingObj):
         return -1
 
 flat_config1 = {
-    "fast_cap": 1<<13, # 8KB, 2 blocks
-    "slow_cap": 1<<14, # 16KB, 4 blocks
+    "fast_cap": 0x12000, # 8KB, 2 blocks
+    "slow_cap": 0x16000, # 16KB, 4 blocks
     "fast_read_lat": 1,
     "fast_write_lat": 1,
     "slow_read_lat": 2,
     "slow_write_lat": 2,
-    "fast_block": 2
+    "fast_block": 2,
+    "swap_policy": SwapPolicy.FastSwap,
 }
 
 class FlatController(TimingObj):
     metasets = {} # set_id -> MetaCache
-    flatmem = FlatMemory(flat_config1)
+    config = flat_config1
+    flatmem = FlatMemory(config)
 
     def trig_monitor(self, event):
         in_fast = self.flatmem.paddr_in_fastmem(event.p_addr)
@@ -156,26 +176,47 @@ class FlatController(TimingObj):
         self.flatmem.sync_cycle()
         self.avail_cycle = max(self.avail_cycle, self.flatmem.avail_cycle)
 
-    def start_migration(self, p_addr1, p_addr2):
+    def gen_swap_event(self, p_addr1, p_addr2):
+        self.flatmem.request(MemEvent(p_addr1, False, self.avail_cycle, is_migration=True))
+        self.flatmem.sync_cycle()
+        self.flatmem.request(MemEvent(p_addr2, False, self.avail_cycle, is_migration=True))
+        self.flatmem.sync_cycle()
+        self.flatmem.request(MemEvent(p_addr1, True, self.avail_cycle, is_migration=True))
+        self.flatmem.sync_cycle()
+        self.flatmem.request(MemEvent(p_addr2, True, self.avail_cycle, is_migration=True))
+        self.flatmem.sync_cycle()
+
+    def start_migration(self, p_addr1, p_addr2, swap_policy):
         infast_1 = self.flatmem.paddr_in_fastmem(p_addr1)
         infast_2 = self.flatmem.paddr_in_fastmem(p_addr2)
+        # p_addr1 is victim page (in fastmem), p_addr2 is challenging page (in slowmem)
         assert(infast_1 ^ infast_2) # must be one fastblock and one slowblock
         p_page1 = extract_bit(p_addr1, addr_page_low, addr_page_bit)
         p_page2 = extract_bit(p_addr2, addr_page_low, addr_page_bit)
-        self.flatmem.request(MemEvent(p_addr1, False, self.avail_cycle, is_migration=True))
-        self.flatmem.request(MemEvent(p_addr2, False, self.avail_cycle, is_migration=True))
-        self.flatmem.request(MemEvent(p_addr1, True, self.avail_cycle, is_migration=True))
-        self.flatmem.request(MemEvent(p_addr2, True, self.avail_cycle, is_migration=True))
-        m_addr1 = self.flatmem.translate_address(p_addr1)
-        m_addr2 = self.flatmem.translate_address(p_addr2)
-        m_page1 = extract_bit(m_addr1, addr_page_low, addr_page_bit)
-        m_page2 = extract_bit(m_addr2, addr_page_low, addr_page_bit)
-        # print("p1 %x m1 %x  p2 %x m2 %x" % (p_addr1, m_addr1, p_addr2, m_addr2))
-        self.flatmem.trans_table[p_page1] = m_page2
-        self.flatmem.trans_table[p_page2] = m_page1
+        if swap_policy == SwapPolicy.FastSwap:
+            self.gen_swap_event(p_addr1, p_addr2)
+            set_id = extract_bit(p_addr1, addr_set_low, addr_set_bit) # p_addr1, p_addr2 must be in the same set
+            m_addr1 = self.metasets[set_id].access_trans_cache(p_addr1)
+            m_addr2 = self.metasets[set_id].access_trans_cache(p_addr2)
+            m_page1 = extract_bit(m_addr1, addr_page_low, addr_page_bit)
+            m_page2 = extract_bit(m_addr2, addr_page_low, addr_page_bit)
+            # print("p1 %x m1 %x  p2 %x m2 %x" % (p_addr1, m_addr1, p_addr2, m_addr2))
+            self.flatmem.trans_table[p_page1] = m_page2
+            self.flatmem.trans_table[p_page2] = m_page1
+        elif swap_policy == SwapPolicy.SlowSwap:
+            set_id = extract_bit(p_addr1, addr_set_low, addr_set_bit) # p_addr1, p_addr2 must be in the same set
+            m_addr1 = self.metasets[set_id].access_trans_cache(p_addr1)
+            if p_addr1 != m_addr1:
+                self.gen_swap_event(p_addr1, m_addr1)
+                self.metasets[set_id].trans_cache_remove(p_addr1)
+            self.gen_swap_event(m_addr1, p_addr2)
+            self.flatmem.trans_table[p_page2] = m_page1
+            assert(len(self.flatmem.trans_table) == self.config["fast_block"]) # in slow swap, size of swapped table is always #fast_block
+
         print("migration done %x(%x) <-> %x(%x)" % (p_addr1, self.flatmem.trans_table[p_page1], p_addr2, self.flatmem.trans_table[p_page2]))
         # print(self.flatmem.trans_table)
         self.sync_cycle()
+        print("fast cycle:%d slow cycle:%d flat cycle:%d" % (self.flatmem.fastmem.avail_cycle, self.flatmem.slowmem.avail_cycle, self.avail_cycle))
 
     def post_access(self, event):
         # migration
@@ -186,18 +227,20 @@ class FlatController(TimingObj):
             if victim_p_region != -1:
                 p_address = event.p_addr
                 victim_p_address = make_address(set_id, victim_p_region, 0)
-                self.start_migration(victim_p_address, p_address)
+                self.start_migration(victim_p_address, p_address, self.config["swap_policy"])
 
     def access(self, event):
         set_id = extract_bit(event.p_addr, addr_set_low, addr_set_bit)
         if not set_id in self.metasets:
             self.metasets[set_id] = MetaCache(set_id, self.flatmem)
         self.metasets[set_id].track_hotness(event)
+        self.metasets[set_id].access_trans_cache(event.p_addr)
         # print("granted access %x" % event.p_addr)
 
         self.flatmem.request(event)
 
         self.sync_cycle()
+        print("fast cycle:%d slow cycle:%d flat cycle:%d" % (self.flatmem.fastmem.avail_cycle, self.flatmem.slowmem.avail_cycle, self.avail_cycle))
         self.post_access(event)
 
 
