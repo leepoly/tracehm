@@ -57,6 +57,10 @@ def make_address(addr_set, addr_region, addr_offset):
 class FlatMemory(TimingObj):
     trans_table = {} # in fastmem. p_page -> m_page
 
+    def trans_table_remove(self, page):
+        if page in self.trans_table:
+            del self.trans_table[page]
+
     def __init__(self, flatconfig):
         self.fastmem = Memory(flatconfig["fast_cap"], flatconfig["fast_read_lat"], flatconfig["fast_write_lat"])
         self.slowmem = Memory(flatconfig["slow_cap"], flatconfig["slow_read_lat"], flatconfig["slow_write_lat"])
@@ -122,7 +126,12 @@ class MetaCache(TimingObj):
         self.flatmem = flatmem
 
     entries = {} # region_id -> hotness
-    cached_trans_table = [] # we do not actually duplicate transtable. Use a bool array to cancel latency for cached mapping.
+    cached_trans_table = [] # List of pages. we do not actually duplicate transtable. Use a bool array to cancel latency for cached mapping.
+
+    def trans_cache_remove(self, page):
+        if self.cached_trans_table.count(page):
+            self.cached_trans_table.remove(page)
+
     def track_hotness(self, event):
         self.timestamp += 1
         p_region = extract_bit(event.p_addr, addr_region_low, addr_region_bit)
@@ -130,13 +139,18 @@ class MetaCache(TimingObj):
 
     def access_trans_cache(self, p_addr):
         p_page = extract_bit(p_addr, addr_page_low, addr_page_bit)
+        # print(self.cached_trans_table)
         if not p_page in self.cached_trans_table:
+            # print("trans_table cache miss add 1 cycle")
             self.flatmem.advance_cycle(True, self.flatmem.trans_table_read_lat) # if miss, add translation latency
             self.flatmem.sync_cycle()
             self.cached_trans_table.append(p_page)
             if len(self.cached_trans_table) > c_trans_cache_capacity_per_set:
-                self.cached_trans_table.pop()
+                self.cached_trans_table.pop(0) # LRU replacement is used. pop the first element
         # if hit, no latency added
+        else:
+            self.cached_trans_table.remove(p_page)
+            self.cached_trans_table.append(p_page)
         return self.flatmem.translate_address(p_addr)
 
     def find_victim(self, event):
@@ -160,7 +174,7 @@ flat_config1 = {
     "slow_read_lat": 2,
     "slow_write_lat": 2,
     "fast_block": 2,
-    "swap_policy": SwapPolicy.FastSwap,
+    "swap_policy": SwapPolicy.SlowSwap,
 }
 
 class FlatController(TimingObj):
@@ -193,9 +207,9 @@ class FlatController(TimingObj):
         assert(infast_1 ^ infast_2) # must be one fastblock and one slowblock
         p_page1 = extract_bit(p_addr1, addr_page_low, addr_page_bit)
         p_page2 = extract_bit(p_addr2, addr_page_low, addr_page_bit)
+        set_id = extract_bit(p_addr1, addr_set_low, addr_set_bit) # p_addr1, p_addr2 must be in the same set
         if swap_policy == SwapPolicy.FastSwap:
             self.gen_swap_event(p_addr1, p_addr2)
-            set_id = extract_bit(p_addr1, addr_set_low, addr_set_bit) # p_addr1, p_addr2 must be in the same set
             m_addr1 = self.metasets[set_id].access_trans_cache(p_addr1)
             m_addr2 = self.metasets[set_id].access_trans_cache(p_addr2)
             m_page1 = extract_bit(m_addr1, addr_page_low, addr_page_bit)
@@ -203,18 +217,24 @@ class FlatController(TimingObj):
             # print("p1 %x m1 %x  p2 %x m2 %x" % (p_addr1, m_addr1, p_addr2, m_addr2))
             self.flatmem.trans_table[p_page1] = m_page2
             self.flatmem.trans_table[p_page2] = m_page1
+            print("migration done %x(%x) <-> %x(%x)" % (p_addr1, self.flatmem.trans_table[p_page1], p_addr2, self.flatmem.trans_table[p_page2]))
         elif swap_policy == SwapPolicy.SlowSwap:
-            set_id = extract_bit(p_addr1, addr_set_low, addr_set_bit) # p_addr1, p_addr2 must be in the same set
-            m_addr1 = self.metasets[set_id].access_trans_cache(p_addr1)
+            m_addr1 = self.metasets[set_id].access_trans_cache(p_addr1) # check whether fastblock is not swapped
+            m_page1 = extract_bit(m_addr1, addr_page_low, addr_page_bit)
             if p_addr1 != m_addr1:
                 self.gen_swap_event(p_addr1, m_addr1)
-                self.metasets[set_id].trans_cache_remove(p_addr1)
+                # print(self.flatmem.trans_table)
+                # print("remove %d %d" % (p_page1, m_page1))
+                self.metasets[set_id].trans_cache_remove(p_page1)
+                self.metasets[set_id].trans_cache_remove(m_page1)
+                self.flatmem.trans_table_remove(p_page1)
+                self.flatmem.trans_table_remove(m_page1)
             self.gen_swap_event(m_addr1, p_addr2)
             self.flatmem.trans_table[p_page2] = m_page1
-            assert(len(self.flatmem.trans_table) == self.config["fast_block"]) # in slow swap, size of swapped table is always #fast_block
+            self.flatmem.trans_table[m_page1] = p_page2
+            print("migration done %x <-> %x <-> %x" % (p_addr1, m_addr1, p_addr2))
+            assert(len(self.flatmem.trans_table) <= 2 * self.config["fast_block"]) # in slow swap, size of swapped table is always 2*fast_block
 
-        print("migration done %x(%x) <-> %x(%x)" % (p_addr1, self.flatmem.trans_table[p_page1], p_addr2, self.flatmem.trans_table[p_page2]))
-        # print(self.flatmem.trans_table)
         self.sync_cycle()
         print("fast cycle:%d slow cycle:%d flat cycle:%d" % (self.flatmem.fastmem.avail_cycle, self.flatmem.slowmem.avail_cycle, self.avail_cycle))
 
