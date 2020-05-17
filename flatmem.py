@@ -198,7 +198,7 @@ flat_config1 = {
     "slow_read_lat": 2,
     "slow_write_lat": 2,
     "fast_block": 2,
-    "swap_policy": SwapPolicy.FastSwap,
+    "swap_policy": SwapPolicy.SmartSwap,
 }
 
 class SmartSwap(object):
@@ -207,15 +207,19 @@ class SmartSwap(object):
     swap_gamma = 1.0 # benefit of one empty slot
     slow_mru_region = -1
     fast_region = [] # head is the LRU while tail is the MRU
-    def __init__(self, rank_list, flatmem):
+    def __init__(self, rank_list, flatmem, set_id):
         self.rank_list = rank_list # head is the LRU while tail is the MRU
         self.flatmem = flatmem
-        for ppage in self.rank_list:
+        self.set_id = set_id
+        self.fast_region = []
+        for pregion in self.rank_list:
+            ppage = extract_bit(make_address(set_id, pregion, 0), addr_page_low, addr_page_bit)
             is_fast = self.flatmem.ppage_in_fastmem(ppage)
-            if (not is_fast) and (self.slow_mru_region == -1):
-                self.slow_mru_region = ppage
+            # print("DEBUG ppage: %x is_fast %x" % (pregion, is_fast))
+            if (not is_fast):
+                self.slow_mru_region = pregion
             elif (is_fast):
-                self.fast_region.append(ppage)
+                self.fast_region.append(pregion)
 
     def search_page_in_rank(self, page):
         for i in range(len(self.rank_list)):
@@ -241,6 +245,9 @@ class SmartSwap(object):
         # we use their LRU order as their rank order
         slow_rank = self.search_page_in_rank(self.slow_mru_region)
         fast_rank = self.search_page_in_rank(self.fast_region[0])
+        # print("DEBUG slow_region %d slow_rank %d" % (self.slow_mru_region, slow_rank))
+        # print("DEBUG fast_region %d fast_rank %d" % (self.fast_region[0], fast_rank))
+        # print("DEBUG fast_regions", self.fast_region)
         repl_util = self.swap_alpha * (slow_rank - fast_rank) - self.swap_beta
         # print("repl get: %d %d %d" % (slow_rank, fast_rank, repl_util))
         # print("fast rank: ", self.fast_page)
@@ -295,8 +302,8 @@ class FlatController(TimingObj):
                 self.gen_swap_event(p_addr1, m_addr1)
                 # print(self.flatmem.trans_table)
                 # print("remove %d %d" % (p_page1, m_page1))
-                self.flatmem.trans_table_remove(p_page1)
-                self.flatmem.trans_table_remove(m_page1)
+                self.flatmem.trans_table_set(p_page1, p_page1)
+                self.flatmem.trans_table_set(m_page1, m_page1)
             self.gen_swap_event(m_addr1, p_addr2)
             self.flatmem.trans_table_set(p_page2, m_page1)
             self.flatmem.trans_table_set(m_page1, p_page2)
@@ -304,14 +311,19 @@ class FlatController(TimingObj):
             assert(len(self.flatmem.trans_table) <= 2 * self.config["fast_block"]) # in slow swap, size of swapped table is always 2*fast_block
         elif swap_policy == SwapPolicy.SmartSwap:
             set_id = extract_bit(p_addr1, addr_set_low, addr_set_bit) # p_addr1, p_addr2 must be in the same set
-            hotness_rank_list = self.metasets[set_id].get_hotness_rank()
-            print("hotness rank:", hotness_rank_list)
-            swap_agent = SmartSwap(hotness_rank_list, self.flatmem)
-            (repl_util, repl_src, repl_dst) = swap_agent.get_repl_util()
-            print("repl: %d %d %d" % (repl_util, repl_src, repl_dst))
-            (restore_util, restore_src, restore_dst) = swap_agent.find_best_restore_choice()
-            print("restore: %d %d %d" % (restore_util, restore_src, restore_dst))
-            if max(repl_util, restore_util) > 0:
+            iteration_cnt = 0
+            while True:
+                if iteration_cnt > 2:
+                    break
+                hotness_rank_list = self.metasets[set_id].get_hotness_rank()
+                print("hotness rank:", hotness_rank_list)
+                swap_agent = SmartSwap(hotness_rank_list, self.flatmem, set_id)
+                (repl_util, repl_src, repl_dst) = swap_agent.get_repl_util()
+                print("repl: %d %d %d" % (repl_util, repl_src, repl_dst))
+                (restore_util, restore_src, restore_dst) = swap_agent.find_best_restore_choice()
+                print("restore: %d %d %d" % (restore_util, restore_src, restore_dst))
+                if max(repl_util, restore_util) <= 0:
+                    break # no more iterations, break the loop
                 if repl_util > restore_util:
                     (swap_region1, swap_region2) = (repl_src, repl_dst)
                 else:
@@ -320,21 +332,21 @@ class FlatController(TimingObj):
                 swap_paddr2 = make_address(set_id, swap_region2, 0x0)
                 swap_page1 = extract_bit(swap_paddr1, addr_page_low, addr_page_bit)
                 swap_page2 = extract_bit(swap_paddr2, addr_page_low, addr_page_bit)
-                print("DEBUG set %d region %d page %x" % (set_id, swap_region1, swap_page1))
+                # print("DEBUG set %d region %d page %x" % (set_id, swap_region1, swap_page1))
 
                 m_addr1 = self.metasets[set_id].access_trans_cache(swap_paddr1)
                 m_addr2 = self.metasets[set_id].access_trans_cache(swap_paddr2)
                 m_page1 = extract_bit(m_addr1, addr_page_low, addr_page_bit)
                 m_page2 = extract_bit(m_addr2, addr_page_low, addr_page_bit)
                 print("migration start", self.flatmem.trans_table)
-                print("DEBUG ppage1 %d  ppage2 %d" % (swap_page1, swap_page2))
-                print("DEBUG mpage1 %d  mpage2 %d" % (m_page2, m_page1))
+                # print("DEBUG ppage1 %d  ppage2 %d" % (swap_page1, swap_page2))
+                # print("DEBUG mpage1 %d  mpage2 %d" % (m_page2, m_page1))
                 self.gen_swap_event(swap_paddr1, swap_paddr2)
+                iteration_cnt += 1
                 self.flatmem.trans_table_set(swap_page1, m_page2)
                 self.flatmem.trans_table_set(swap_page2, m_page1)
                 # print("migration done %x(%x) <-> %x(%x)" % (p_addr1, self.flatmem.trans_table[p_page1], p_addr2, self.flatmem.trans_table[p_page2]))
                 print("migration done", self.flatmem.trans_table)
-                # TODO: for loop
 
         self.sync_cycle()
         print("fast cycle:%d slow cycle:%d flat cycle:%d" % (self.flatmem.fastmem.avail_cycle, self.flatmem.slowmem.avail_cycle, self.avail_cycle))
