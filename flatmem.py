@@ -35,6 +35,7 @@ class Memory(TimingObj):
     def request(self, event):
         # print("addr:%x capacity:%x" % (event.m_addr, self.capacity))
         if event.m_addr > self.capacity:
+            print("[Error] Out of memory!")
             return -1 # out of memory exception
         if event.is_write:
             self.avail_cycle = max(self.avail_cycle, event.current_cycle) + self.write_lat
@@ -126,6 +127,7 @@ class FlatMemory(TimingObj):
             self.fastmem.request(event)
         else:
             self.slowmem.request(event)
+        self.sync_cycle()
 
 # MetaCaches are in the unit of set. They are usually put in SRAM.
 # They store the cache of trans_table for better performance. They also monitor hotness of blocks (by their region id of paddr, not maddr).
@@ -192,19 +194,19 @@ class MetaCache(TimingObj):
 
 flat_config1 = {
     "fast_cap": 0x12000, # 8KB, 2 blocks
-    "slow_cap": 0x16000, # 16KB, 4 blocks
+    "slow_cap": 0x20000, # 64KB, 14 blocks
     "fast_read_lat": 1,
     "fast_write_lat": 1,
     "slow_read_lat": 2,
     "slow_write_lat": 2,
     "fast_block": 2,
-    "swap_policy": SwapPolicy.SmartSwap,
+    "swap_policy": SwapPolicy.SlowSwap,
 }
 
 class SmartSwap(object):
     swap_alpha = 3.5 # benefit of relative rank
     swap_beta = 6 # cost of one migration
-    swap_gamma = 1.0 # benefit of one empty slot
+    swap_gamma = 3.0 # benefit of one empty slot
     slow_mru_region = -1
     fast_region = [] # head is the LRU while tail is the MRU
     def __init__(self, rank_list, flatmem, set_id):
@@ -296,17 +298,27 @@ class FlatController(TimingObj):
             print("migration done", self.flatmem.trans_table)
             # print("migration done %x(%x) <-> %x(%x)" % (p_addr1, self.flatmem.trans_table[p_page1], p_addr2, self.flatmem.trans_table[p_page2]))
         elif swap_policy == SwapPolicy.SlowSwap:
+            # exception: when the challenger was originally in fastmem, swap challenger with trans[challenger]
+            if self.flatmem.maddr_in_fastmem(p_addr2):
+                p_addr1 = self.metasets[set_id].access_trans_cache(p_addr2)
+
             m_addr1 = self.metasets[set_id].access_trans_cache(p_addr1) # check whether fastblock is not swapped
             m_page1 = extract_bit(m_addr1, addr_page_low, addr_page_bit)
+            print("DEBUG victim paddr: %x" % (p_addr1))
+            print("DEBUG challenging paddr: %x" % (p_addr2))
+            print("first migrate %x %x" % (p_addr1, m_addr1))
             if p_addr1 != m_addr1:
+                print("migration start", self.flatmem.trans_table)
                 self.gen_swap_event(p_addr1, m_addr1)
                 # print(self.flatmem.trans_table)
-                # print("remove %d %d" % (p_page1, m_page1))
+                print("remove %d %d" % (p_page1, m_page1))
                 self.flatmem.trans_table_set(p_page1, p_page1)
                 self.flatmem.trans_table_set(m_page1, m_page1)
+            print("swap %x %x" % (m_addr1, p_addr2))
             self.gen_swap_event(m_addr1, p_addr2)
             self.flatmem.trans_table_set(p_page2, m_page1)
             self.flatmem.trans_table_set(m_page1, p_page2)
+            print("migration done", self.flatmem.trans_table)
             print("migration done %x <-> %x <-> %x" % (p_addr1, m_addr1, p_addr2))
             assert(len(self.flatmem.trans_table) <= 2 * self.config["fast_block"]) # in slow swap, size of swapped table is always 2*fast_block
         elif swap_policy == SwapPolicy.SmartSwap:
