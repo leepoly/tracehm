@@ -1,3 +1,4 @@
 .vscode/settings.json
 demo_trace.txt
 __pycache__/*
+.vscode/**

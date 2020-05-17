@@ -80,6 +80,10 @@ class FlatMemory(TimingObj):
         m_page = self.trans_table.get(p_page, p_page) # default=p_page
         return self.mpage_in_fastmem(m_page)
 
+    def ppage_in_fastmem(self, ppage):
+        m_page = self.trans_table.get(ppage, ppage) # default=p_page
+        return self.mpage_in_fastmem(m_page)
+
     def translate_address(self, paddress):
         p_page = extract_bit(paddress, addr_page_low, addr_page_bit)
         p_offset = extract_bit(paddress, addr_offset_low, addr_offset_bit)
@@ -87,6 +91,14 @@ class FlatMemory(TimingObj):
         m_address = (m_page << addr_page_low) | p_offset
         # print("translate paddr%x maddr%x" % (paddress, m_address))
         return m_address
+
+    def translate_page_inv(self, ppage):
+        if not ppage in self.trans_table:
+            # ppage is not swapped. The inverted page is itself
+            return ppage
+        for (ppage_i, mpage_i) in self.trans_table.items():
+            if mpage_i == ppage:
+                return ppage_i
 
     def sync_cycle(self):
         self.avail_cycle = max(self.fastmem.avail_cycle, self.slowmem.avail_cycle)
@@ -102,7 +114,6 @@ class FlatMemory(TimingObj):
     def request(self, event):
         event.m_addr = self.translate_address(event.p_addr)
         in_fast = self.maddr_in_fastmem(event.m_addr)
-        # self.advance_cycle(True, self.trans_table_read_lat) # advance fastmem avail_cycle. trans_table always in fastmem TODO: need to modify
         if not event.is_migration:
             print("granted access %x -> %x in_fast %x" % (event.p_addr, event.m_addr, in_fast))
         if in_fast:
@@ -165,6 +176,12 @@ class MetaCache(TimingObj):
         if min_hotness_region != -1:
             return min_hotness_region
         return -1
+    def get_hotness_rank(self):
+        # return self.entries
+        sorted_list = sorted(self.entries.items(), key = lambda item: item[1].hotness)
+        hotness_list = list(map(lambda item: item[0], sorted_list))
+        print(hotness_list)
+        return hotness_list
 
 flat_config1 = {
     "fast_cap": 0x12000, # 8KB, 2 blocks
@@ -174,8 +191,50 @@ flat_config1 = {
     "slow_read_lat": 2,
     "slow_write_lat": 2,
     "fast_block": 2,
-    "swap_policy": SwapPolicy.SlowSwap,
+    "swap_policy": SwapPolicy.SmartSwap,
 }
+
+class SmartSwap(object):
+    swap_alpha = 1.0 # benefit of relative rank
+    swap_beta = 6 # cost of one migration
+    swap_gamma = 1.0 # benefit of one empty slot
+    slow_mru_page = -1
+    fast_page = [] # head is the LRU while tail is the MRU
+    def __init__(self, rank_list, flatmem):
+        self.rank_list = rank_list # head is the LRU while tail is the MRU
+        self.flatmem = flatmem
+        for ppage in self.rank_list:
+            is_fast = self.flatmem.ppage_in_fastmem(ppage)
+            if (not is_fast) and (self.slow_mru_page == -1):
+                self.slow_mru_page = ppage
+            elif (is_fast):
+                self.fast_page.append(ppage)
+
+    def search_page_in_rank(self, page):
+        for i in range(len(self.rank_list)):
+            if self.rank_list[i] == page:
+                return i # return the rank
+        return -1
+
+    def find_best_restore_choice(self):
+        max_util = -1
+        best_src = best_dst = -1
+        for ppage in self.fast_page:
+            ppage_prev = self.flatmem.translate_page_inv(ppage)
+            ppage_rank = self.search_page_in_rank(ppage)
+            ppage_prev_rank = self.flatmem.translate_page_inv(ppage_rank)
+
+            if (self.swap_alpha * (ppage_prev_rank - ppage_rank) + self.swap_gamma - self.swap_beta) > max_util:
+                max_util = self.swap_alpha * (ppage_prev_rank - ppage_rank) + self.swap_gamma - self.swap_beta
+                best_src, best_dst = ppage, ppage_prev
+        return (max_util, best_src, best_dst)
+
+    def get_repl_util(self):
+        # swap most inactive fast and most active slowblock
+        slow_rank = self.search_page_in_rank(self.slow_mru_page)
+        fast_rank = self.search_page_in_rank(self.fast_page[-1])
+        repl_util = self.swap_alpha * (slow_rank - fast_rank) - self.swap_beta
+        return (repl_util, self.slow_mru_page, self.fast_page[-1])
 
 class FlatController(TimingObj):
     metasets = {} # set_id -> MetaCache
@@ -225,8 +284,6 @@ class FlatController(TimingObj):
                 self.gen_swap_event(p_addr1, m_addr1)
                 # print(self.flatmem.trans_table)
                 # print("remove %d %d" % (p_page1, m_page1))
-                self.metasets[set_id].trans_cache_remove(p_page1)
-                self.metasets[set_id].trans_cache_remove(m_page1)
                 self.flatmem.trans_table_remove(p_page1)
                 self.flatmem.trans_table_remove(m_page1)
             self.gen_swap_event(m_addr1, p_addr2)
@@ -234,6 +291,25 @@ class FlatController(TimingObj):
             self.flatmem.trans_table[m_page1] = p_page2
             print("migration done %x <-> %x <-> %x" % (p_addr1, m_addr1, p_addr2))
             assert(len(self.flatmem.trans_table) <= 2 * self.config["fast_block"]) # in slow swap, size of swapped table is always 2*fast_block
+        elif swap_policy == SwapPolicy.SmartSwap:
+            set_id = extract_bit(p_addr1, addr_set_low, addr_set_bit) # p_addr1, p_addr2 must be in the same set
+            hotness_rank_list = self.metasets[set_id].get_hotness_rank()
+            swap_agent = SmartSwap(hotness_rank_list, self.flatmem)
+            (repl_util, repl_src, repl_dst) = swap_agent.get_repl_util()
+            (restore_util, restore_src, restore_dst) = swap_agent.find_best_restore_choice()
+            if repl_util > restore_util:
+                (swap_page1, swap_page2) = (repl_src, repl_dst)
+            else:
+                (swap_page1, swap_page2) = (restore_src, restore_dst)
+            swap_paddr1 = swap_page1 << addr_page_low
+            swap_paddr2 = swap_page2 << addr_page_low
+            m_page1 = self.metasets[set_id].access_trans_cache(swap_paddr1)
+            m_page2 = self.metasets[set_id].access_trans_cache(swap_paddr2)
+            self.gen_swap_event(swap_paddr1, swap_paddr2)
+            self.flatmem.trans_table[p_page1] = m_page2
+            self.flatmem.trans_table[p_page2] = m_page1
+            print("migration done %x(%x) <-> %x(%x)" % (p_addr1, self.flatmem.trans_table[p_page1], p_addr2, self.flatmem.trans_table[p_page2]))
+            # TODO: for loop
 
         self.sync_cycle()
         print("fast cycle:%d slow cycle:%d flat cycle:%d" % (self.flatmem.fastmem.avail_cycle, self.flatmem.slowmem.avail_cycle, self.avail_cycle))
