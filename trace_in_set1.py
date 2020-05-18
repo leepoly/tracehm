@@ -21,7 +21,7 @@ if __name__ == "__main__":
         except (ValueError, IndexError):
             print(cnt2)
             continue
-        if set_i == 1:
+        if set_i < 2:
             trace_out.write("%d\t0x%x\t%x\n" % (cnt, addr, is_write))
             cnt += 1
 

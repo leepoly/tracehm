@@ -6,12 +6,12 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("usage: python3 %s traceoutput" % sys.argv[0])
         sys.exit(0)
-    n_access = 200
+    n_access = 30000
     cnt = 0
     with open(sys.argv[1], 'w+') as tracefile:
         for i in range(n_access):
-            set_i = 1
-            region_i = random.randint(0, 8)
+            set_i = random.randint(0, 1) # set in [0, 1]
+            region_i = random.randint(0, 6) # region in [0, 15]
             # region_i = random.randint(0, (1<<flatmem.addr_region_bit) - 1)
             is_write_i = random.randint(0, 1)
             addr_i = flatmem.make_address(set_i, region_i, 0)
