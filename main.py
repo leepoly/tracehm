@@ -13,3 +13,4 @@ if __name__ == "__main__":
             is_write = (int(arr[2]) == 1)
             new_event = flatmem.MemEvent(addr, is_write, 0)
             memoryctl.access(new_event)
+    memoryctl.showstats()

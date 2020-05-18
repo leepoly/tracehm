@@ -1,4 +1,5 @@
 from enum import Enum
+import random
 
 class TimingObj(object):
     avail_cycle = 0
@@ -14,6 +15,9 @@ class SwapPolicy(Enum):
     FastSwap = 0
     SlowSwap = 1
     SmartSwap = 2
+class BypassPolicy(Enum):
+    Never = 0
+    Probability = 1
 
 addr_bit = 48
 addr_page_low = 12
@@ -26,6 +30,7 @@ addr_set_low = addr_region_low + addr_region_bit
 addr_set_bit = addr_bit - addr_set_low
 INF = 1000000000
 c_trans_cache_capacity_per_set = 4
+bypass_probability = 0.5
 
 class Memory(TimingObj):
     def __init__(self, capacity, read_lat, write_lat):
@@ -113,8 +118,9 @@ class FlatMemory(TimingObj):
         self.avail_cycle = max(self.fastmem.avail_cycle, self.slowmem.avail_cycle)
 
     def trans_table_set(self, new_ppage, new_mpage):
-        if (new_ppage == new_mpage) and (new_ppage in self.trans_table):
-            del self.trans_table[new_ppage]
+        if new_ppage == new_mpage:
+            if new_ppage in self.trans_table:
+                del self.trans_table[new_ppage]
             return
         self.trans_table[new_ppage] = new_mpage
 
@@ -122,7 +128,8 @@ class FlatMemory(TimingObj):
         event.m_addr = self.translate_address(event.p_addr)
         in_fast = self.maddr_in_fastmem(event.m_addr)
         if not event.is_migration:
-            print("granted access %x -> %x in_fast %x" % (event.p_addr, event.m_addr, in_fast))
+            pass
+            # print("granted access %x -> %x in_fast %x" % (event.p_addr, event.m_addr, in_fast))
         if in_fast:
             self.fastmem.request(event)
         else:
@@ -193,20 +200,21 @@ class MetaCache(TimingObj):
         return hotness_list
 
 flat_config1 = {
-    "fast_cap": 0x12000, # 8KB, 2 blocks
-    "slow_cap": 0x20000, # 64KB, 14 blocks
+    "fast_cap": 0x21fff, # 16KB, 2 blocks * 2 sets
+    "slow_cap": 0x2ffff, # 128KB, 14 blocks * 2 sets
     "fast_read_lat": 1,
     "fast_write_lat": 1,
     "slow_read_lat": 2,
     "slow_write_lat": 2,
     "fast_block": 2,
-    "swap_policy": SwapPolicy.SlowSwap,
+    "swap_policy": SwapPolicy.SmartSwap,
+    "bypass_policy": BypassPolicy.Never,
 }
 
 class SmartSwap(object):
-    swap_alpha = 3.5 # benefit of relative rank
+    swap_alpha = 3.0 # benefit of relative rank
     swap_beta = 6 # cost of one migration
-    swap_gamma = 3.0 # benefit of one empty slot
+    swap_gamma = 6.0 # benefit of one empty slot: 1.0
     slow_mru_region = -1
     fast_region = [] # head is the LRU while tail is the MRU
     def __init__(self, rank_list, flatmem, set_id):
@@ -223,7 +231,7 @@ class SmartSwap(object):
             elif (is_fast):
                 self.fast_region.append(pregion)
 
-    def search_page_in_rank(self, page):
+    def search_region_in_rank(self, page):
         for i in range(len(self.rank_list)):
             if self.rank_list[i] == page:
                 return i # return the rank
@@ -232,21 +240,25 @@ class SmartSwap(object):
     def find_best_restore_choice(self):
         max_util = -1
         best_src = best_dst = -1
-        for ppage in self.fast_region:
+        for pregion in self.fast_region:
+            ppage = extract_bit(make_address(self.set_id, pregion, 0), addr_page_low, addr_page_bit)
             ppage_prev = self.flatmem.translate_page_inv(ppage)
-            ppage_rank = self.search_page_in_rank(ppage)
-            ppage_prev_rank = self.flatmem.translate_page_inv(ppage_rank)
+            if ppage_prev != ppage:
+                pregion_prev = extract_bit(ppage_prev, addr_region_low, addr_region_bit)
+                ppage_rank = self.search_region_in_rank(pregion)
+                ppage_prev_rank = self.search_region_in_rank(pregion_prev)
+                # print("DEBUG ppage %x rank %x prev %x rank %x util %d" % (ppage, ppage_rank, ppage_prev, ppage_prev_rank, (self.swap_alpha * (ppage_prev_rank - ppage_rank) + self.swap_gamma - self.swap_beta)))
 
-            if (self.swap_alpha * (ppage_prev_rank - ppage_rank) + self.swap_gamma - self.swap_beta) > max_util:
-                max_util = self.swap_alpha * (ppage_prev_rank - ppage_rank) + self.swap_gamma - self.swap_beta
-                best_src, best_dst = ppage, ppage_prev
+                if (self.swap_alpha * (ppage_prev_rank - ppage_rank) + self.swap_gamma - self.swap_beta) > max_util:
+                    max_util = self.swap_alpha * (ppage_prev_rank - ppage_rank) + self.swap_gamma - self.swap_beta
+                    best_src, best_dst = ppage, ppage_prev
         return (max_util, best_src, best_dst)
 
     def get_repl_util(self):
         # swap most inactive fast and most active slowblock
         # we use their LRU order as their rank order
-        slow_rank = self.search_page_in_rank(self.slow_mru_region)
-        fast_rank = self.search_page_in_rank(self.fast_region[0])
+        slow_rank = self.search_region_in_rank(self.slow_mru_region)
+        fast_rank = self.search_region_in_rank(self.fast_region[0])
         # print("DEBUG slow_region %d slow_rank %d" % (self.slow_mru_region, slow_rank))
         # print("DEBUG fast_region %d fast_rank %d" % (self.fast_region[0], fast_rank))
         # print("DEBUG fast_regions", self.fast_region)
@@ -260,9 +272,22 @@ class FlatController(TimingObj):
     config = flat_config1
     flatmem = FlatMemory(config)
 
+    def __init__(self):
+        if self.config["swap_policy"] == SwapPolicy.SmartSwap:
+            self.smart_swap_repl_cnt = 0
+            self.smart_swap_restore_cnt = 0
+        elif self.config["swap_policy"] == SwapPolicy.FastSwap:
+            self.fast_swap_swap_cnt = 0
+
     def trig_monitor(self, event):
         in_fast = self.flatmem.paddr_in_fastmem(event.p_addr)
-        return not in_fast # migrate if access slowmem
+        if self.config["bypass_policy"] == BypassPolicy.Never:
+            return not in_fast # migrate if access slowmem
+        elif self.config["bypass_policy"] == BypassPolicy.Probability:
+            if random.random() > bypass_probability:
+                return False
+            else:
+                return not in_fast # migrate if access slowmem
 
     def sync_cycle(self):
         self.flatmem.sync_cycle()
@@ -288,6 +313,7 @@ class FlatController(TimingObj):
         set_id = extract_bit(p_addr1, addr_set_low, addr_set_bit) # p_addr1, p_addr2 must be in the same set
         if swap_policy == SwapPolicy.FastSwap:
             self.gen_swap_event(p_addr1, p_addr2)
+            self.fast_swap_swap_cnt += 1
             m_addr1 = self.metasets[set_id].access_trans_cache(p_addr1)
             m_addr2 = self.metasets[set_id].access_trans_cache(p_addr2)
             m_page1 = extract_bit(m_addr1, addr_page_low, addr_page_bit)
@@ -301,6 +327,7 @@ class FlatController(TimingObj):
             # exception: when the challenger was originally in fastmem, swap challenger with trans[challenger]
             if self.flatmem.maddr_in_fastmem(p_addr2):
                 p_addr1 = self.metasets[set_id].access_trans_cache(p_addr2)
+                p_page1 = extract_bit(p_addr1, addr_page_low, addr_page_bit)
 
             m_addr1 = self.metasets[set_id].access_trans_cache(p_addr1) # check whether fastblock is not swapped
             m_page1 = extract_bit(m_addr1, addr_page_low, addr_page_bit)
@@ -320,30 +347,36 @@ class FlatController(TimingObj):
             self.flatmem.trans_table_set(m_page1, p_page2)
             print("migration done", self.flatmem.trans_table)
             print("migration done %x <-> %x <-> %x" % (p_addr1, m_addr1, p_addr2))
-            assert(len(self.flatmem.trans_table) <= 2 * self.config["fast_block"]) # in slow swap, size of swapped table is always 2*fast_block
+            # assert(len(self.flatmem.trans_table) <= 2 * self.config["fast_block"]) # in slow swap, size of swapped table is always 2*fast_block*set_num
+            assert(len(self.flatmem.trans_table) % 2 == 0) # in slow swap, all swapping is 2-node circle
         elif swap_policy == SwapPolicy.SmartSwap:
             set_id = extract_bit(p_addr1, addr_set_low, addr_set_bit) # p_addr1, p_addr2 must be in the same set
             iteration_cnt = 0
+            swap_history = [] # stop replicate swappings
             while True:
-                if iteration_cnt > 2:
-                    break
+                # if iteration_cnt > 2: # for debugging
+                #     break
                 hotness_rank_list = self.metasets[set_id].get_hotness_rank()
-                print("hotness rank:", hotness_rank_list)
                 swap_agent = SmartSwap(hotness_rank_list, self.flatmem, set_id)
                 (repl_util, repl_src, repl_dst) = swap_agent.get_repl_util()
-                print("repl: %d %d %d" % (repl_util, repl_src, repl_dst))
                 (restore_util, restore_src, restore_dst) = swap_agent.find_best_restore_choice()
-                print("restore: %d %d %d" % (restore_util, restore_src, restore_dst))
                 if max(repl_util, restore_util) <= 0:
                     break # no more iterations, break the loop
+                print("hotness rank:", hotness_rank_list)
+                print("repl: %d %d %d" % (repl_util, repl_src, repl_dst))
+                print("restore: %d %d %d" % (restore_util, restore_src, restore_dst))
                 if repl_util > restore_util:
                     (swap_region1, swap_region2) = (repl_src, repl_dst)
+                    self.smart_swap_repl_cnt += 1
                 else:
                     (swap_region1, swap_region2) = (restore_src, restore_dst)
+                    self.smart_swap_restore_cnt += 1
                 swap_paddr1 = make_address(set_id, swap_region1, 0x0)
                 swap_paddr2 = make_address(set_id, swap_region2, 0x0)
                 swap_page1 = extract_bit(swap_paddr1, addr_page_low, addr_page_bit)
                 swap_page2 = extract_bit(swap_paddr2, addr_page_low, addr_page_bit)
+                if swap_history.count((swap_paddr1, swap_paddr2)) > 0:
+                    break # replicate swappings, break the loop
                 # print("DEBUG set %d region %d page %x" % (set_id, swap_region1, swap_page1))
 
                 m_addr1 = self.metasets[set_id].access_trans_cache(swap_paddr1)
@@ -353,6 +386,7 @@ class FlatController(TimingObj):
                 print("migration start", self.flatmem.trans_table)
                 # print("DEBUG ppage1 %d  ppage2 %d" % (swap_page1, swap_page2))
                 # print("DEBUG mpage1 %d  mpage2 %d" % (m_page2, m_page1))
+                swap_history.append((swap_paddr1, swap_paddr2))
                 self.gen_swap_event(swap_paddr1, swap_paddr2)
                 iteration_cnt += 1
                 self.flatmem.trans_table_set(swap_page1, m_page2)
@@ -361,12 +395,11 @@ class FlatController(TimingObj):
                 print("migration done", self.flatmem.trans_table)
 
         self.sync_cycle()
-        print("fast cycle:%d slow cycle:%d flat cycle:%d" % (self.flatmem.fastmem.avail_cycle, self.flatmem.slowmem.avail_cycle, self.avail_cycle))
+        # print("fast cycle:%d slow cycle:%d flat cycle:%d" % (self.flatmem.fastmem.avail_cycle, self.flatmem.slowmem.avail_cycle, self.avail_cycle))
 
     def post_access(self, event):
         # migration
         set_id = extract_bit(event.p_addr, addr_set_low, addr_set_bit)
-        # print("DEBUG 1 %x" % self.trig_monitor(event))
         if self.trig_monitor(event):
             victim_p_region = self.metasets[set_id].find_victim(event)
             if victim_p_region != -1:
@@ -385,7 +418,15 @@ class FlatController(TimingObj):
         self.flatmem.request(event)
 
         self.sync_cycle()
-        print("fast cycle:%d slow cycle:%d flat cycle:%d" % (self.flatmem.fastmem.avail_cycle, self.flatmem.slowmem.avail_cycle, self.avail_cycle))
+        # print("fast cycle:%d slow cycle:%d flat cycle:%d" % (self.flatmem.fastmem.avail_cycle, self.flatmem.slowmem.avail_cycle, self.avail_cycle))
         self.post_access(event)
+
+    def showstats(self):
+        if self.config["swap_policy"] == SwapPolicy.SmartSwap:
+            print("smartswap count repl:%d restore:%d" % (self.smart_swap_repl_cnt, self.smart_swap_restore_cnt))
+        elif self.config["swap_policy"] == SwapPolicy.FastSwap:
+            print("fastswap count %d" % (self.fast_swap_swap_cnt))
+        print("fast cycle:%d slow cycle:%d flat cycle:%d" % (self.flatmem.fastmem.avail_cycle, self.flatmem.slowmem.avail_cycle, self.avail_cycle))
+
 
 
