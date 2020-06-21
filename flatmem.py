@@ -20,6 +20,11 @@ class SwapPolicy(Enum):
 class BypassPolicy(Enum):
     Never = 0
     Probability = 1
+class ReplPolicy(Enum):
+    Random = 0
+    LRU = 1 # LRULIP
+    LRULIP = 2
+    LFU = 3
 
 addr_bit = 48
 addr_page_low = 12
@@ -55,7 +60,7 @@ class Memory(TimingObj):
         event.current_cycle = self.avail_cycle
         if not event.is_migration:
             self.access_cnt += 1
-            # print("Access %s  %x %d!" % (self.name, event.m_addr, self.access_cnt))
+            # print("[info] Access %s  %x" % (self.name, event.m_addr))
 
 def extract_bit(value, start, len):
     tmp = value >> start
@@ -157,10 +162,10 @@ class CacheEntry(object):
 
 class MetaCache(TimingObj):
     set_id = 0
-    timestamp = 0
     def __init__(self, set_id, flatmem):
         self.set_id = set_id
         self.flatmem = flatmem
+        self.timestamp = 0 # for ReplPolicy.LRU or ReplPolicy.LRULIP
 
     entries = {} # region_id -> hotness
     cached_trans_table = [] # List of pages. we do not actually duplicate transtable. Use a bool array to cancel latency for cached mapping.
@@ -169,10 +174,29 @@ class MetaCache(TimingObj):
         if self.cached_trans_table.count(page):
             self.cached_trans_table.remove(page)
 
-    def track_hotness(self, event):
-        self.timestamp += 1
+    def track_hotness(self, event, repl_policy):
+        # update global registers
+        if repl_policy == ReplPolicy.LRU or repl_policy == ReplPolicy.LRULIP:
+            self.timestamp += 1
+        new_entry = False
         p_region = extract_bit(event.p_addr, addr_region_low, addr_region_bit)
-        self.entries[p_region] = CacheEntry(self.timestamp) # we use timestamp LRU to track hotness
+        # create new entry
+        if not p_region in self.entries:
+            if repl_policy == ReplPolicy.LRU or repl_policy == ReplPolicy.LRULIP:
+                self.entries[p_region] = CacheEntry(0)
+                new_entry = True
+            elif repl_policy == ReplPolicy.LFU:
+                self.entries[p_region] = CacheEntry(0)
+            elif repl_policy == ReplPolicy.Random:
+                self.entries[p_region] = CacheEntry(random.randint(1, (1 << addr_set_bit) ** 3))
+        # update existing entry
+        if repl_policy == ReplPolicy.LFU:
+            self.entries[p_region] = CacheEntry(self.entries[p_region].hotness + 1)
+        elif repl_policy == ReplPolicy.LRU:
+            self.entries[p_region] = CacheEntry(self.timestamp)
+        elif repl_policy == ReplPolicy.LRULIP and (not new_entry):
+            self.entries[p_region] = CacheEntry(self.timestamp)
+        # print("debug region:%x hotness:%d" % (p_region, self.entries[p_region].hotness))
 
     def access_trans_cache(self, p_addr):
         p_page = extract_bit(p_addr, addr_page_low, addr_page_bit)
@@ -198,6 +222,8 @@ class MetaCache(TimingObj):
         for region_id, item in self.entries.items():
             p_addr = make_address(self.set_id, region_id, 0)
             if self.flatmem.paddr_in_fastmem(p_addr):
+                if item.hotness > INF:
+                    print("[warning] hotness over INF")
                 if item.hotness < min_hotness:
                     min_hotness = item.hotness
                     min_hotness_region = region_id
@@ -223,19 +249,7 @@ flat_config1 = {
     "swap_policy": SwapPolicy.SmartSwap,
     "bypass_policy": BypassPolicy.Probability,
     "bypass_probability": 0.5,
-}
-
-flat_config_bypass = {
-    "fast_cap": 0x1001fff, # 16KB, 2 blocks * 15 sets
-    "slow_cap": 0x100ffff, # 128KB, 14 blocks * 15 sets
-    "fast_read_lat": 1,
-    "fast_write_lat": 1,
-    "slow_read_lat": 2,
-    "slow_write_lat": 2,
-    "fast_block": 2,
-    "swap_policy": SwapPolicy.SmartSwap,
-    "bypass_policy": BypassPolicy.Probability,
-    "bypass_probability": 0.5, # if P > threshold, bypass
+    "repl_policy": ReplPolicy.LRU,
 }
 
 flat_config_dram_nvm = {
@@ -249,6 +263,7 @@ flat_config_dram_nvm = {
     "swap_policy": SwapPolicy.SlowSwap,
     "bypass_policy": BypassPolicy.Probability,
     "bypass_probability": 0.5,
+    "repl_policy": ReplPolicy.LRU,
 }
 
 class SmartSwap(object):
@@ -317,14 +332,15 @@ class FlatController(TimingObj):
                 continue
             if k_i == "swap_policy":
                 self.config["swap_policy"] = SwapPolicy[v_i]
-                print("[info] change %s to %s" % (k_i, v_i))
             elif k_i == "bypass_policy":
                 self.config["bypass_policy"] = BypassPolicy[v_i]
-                print("[info] change %s to %s" % (k_i, v_i))
+            elif k_i == "repl_policy":
+                self.config["repl_policy"] = ReplPolicy[v_i]
             elif isinstance(self.config[k_i], int):
                 self.config[k_i] = int(v_i)
             elif isinstance(self.config[k_i], float):
                 self.config[k_i] = float(v_i)
+            print("[info] change %s to %s" % (k_i, v_i))
 
         if self.config["swap_policy"] == SwapPolicy.SmartSwap:
             self.smart_swap_repl_cnt = 0
@@ -378,10 +394,10 @@ class FlatController(TimingObj):
             m_addr2 = self.metasets[set_id].access_trans_cache(p_addr2)
             m_page1 = extract_bit(m_addr1, addr_page_low, addr_page_bit)
             m_page2 = extract_bit(m_addr2, addr_page_low, addr_page_bit)
-            # print("p1 %x m1 %x  p2 %x m2 %x" % (p_addr1, m_addr1, p_addr2, m_addr2))
+            # print("[info] p1 %x m1 %x  p2 %x m2 %x" % (p_addr1, m_addr1, p_addr2, m_addr2))
             self.flatmem.trans_table_set(p_page1, m_page2)
             self.flatmem.trans_table_set(p_page2, m_page1)
-            # print("migration done", self.flatmem.trans_table)
+            # print("[info] migration done", self.flatmem.trans_table)
             # print("migration done %x(%x) <-> %x(%x)" % (p_addr1, self.flatmem.trans_table[p_page1], p_addr2, self.flatmem.trans_table[p_page2]))
         elif swap_policy == SwapPolicy.SlowSwap:
             # exception: when the challenger was originally in fastmem, swap challenger with trans[challenger]
@@ -472,7 +488,7 @@ class FlatController(TimingObj):
         set_id = extract_bit(event.p_addr, addr_set_low, addr_set_bit)
         if not set_id in self.metasets:
             self.metasets[set_id] = MetaCache(set_id, self.flatmem)
-        self.metasets[set_id].track_hotness(event)
+        self.metasets[set_id].track_hotness(event, self.config["repl_policy"])
         self.metasets[set_id].access_trans_cache(event.p_addr)
         # print("cnt: %d granted access %x" % (self.access_cnt, event.p_addr))
 
