@@ -307,7 +307,7 @@ class FlatController(TimingObj):
     access_cnt = 0
 
     def __init__(self):
-        self.config = flat_config1 # select a proper config
+        self.config = flat_config1 # select default config
         self.flatmem = FlatMemory(self.config)
 
     def set_config(self, dic):
@@ -316,13 +316,16 @@ class FlatController(TimingObj):
                 print("[warning] ignore %s" % k_i)
                 continue
             if k_i == "swap_policy":
-                self.config["swap_policy"] = SwapPolicy(int(v_i))
+                self.config["swap_policy"] = SwapPolicy[v_i]
+                print("[info] change %s to %s" % (k_i, v_i))
             elif k_i == "bypass_policy":
-                self.config["bypass_policy"] = BypassPolicy(int(v_i))
+                self.config["bypass_policy"] = BypassPolicy[v_i]
+                print("[info] change %s to %s" % (k_i, v_i))
             elif isinstance(self.config[k_i], int):
                 self.config[k_i] = int(v_i)
             elif isinstance(self.config[k_i], float):
                 self.config[k_i] = float(v_i)
+
         if self.config["swap_policy"] == SwapPolicy.SmartSwap:
             self.smart_swap_repl_cnt = 0
             self.smart_swap_restore_cnt = 0
