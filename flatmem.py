@@ -25,6 +25,7 @@ class ReplPolicy(Enum):
     LRU = 1 # LRULIP
     LRULIP = 2
     LFU = 3
+    LRFU = 4
 
 addr_bit = 48
 addr_page_low = 12
@@ -151,6 +152,7 @@ class FlatMemory(TimingObj):
         else:
             self.slowmem.request(event)
         self.sync_cycle()
+        return in_fast
 
 # MetaCaches are in the unit of set. They are usually put in SRAM.
 # They store the cache of trans_table for better performance. They also monitor hotness of blocks (by their region id of paddr, not maddr).
@@ -166,6 +168,7 @@ class MetaCache(TimingObj):
         self.set_id = set_id
         self.flatmem = flatmem
         self.timestamp = 0 # for ReplPolicy.LRU or ReplPolicy.LRULIP
+        self.lrfu_history = {} # fast_region -> [timestamps of history accesses]
 
     entries = {} # region_id -> hotness
     cached_trans_table = [] # List of pages. we do not actually duplicate transtable. Use a bool array to cancel latency for cached mapping.
@@ -245,9 +248,9 @@ flat_config1 = {
     "fast_write_lat": 1,
     "slow_read_lat": 2,
     "slow_write_lat": 2,
-    "fast_block": 4,
-    "swap_policy": SwapPolicy.SmartSwap,
-    "bypass_policy": BypassPolicy.Probability,
+    "fast_block": 2,
+    "swap_policy": SwapPolicy.FastSwap,
+    "bypass_policy": BypassPolicy.Never,
     "bypass_probability": 0.5,
     "repl_policy": ReplPolicy.LRU,
 }
@@ -324,6 +327,8 @@ class FlatController(TimingObj):
     def __init__(self):
         self.config = flat_config1 # select default config
         self.flatmem = FlatMemory(self.config)
+        self.epoch_slowhit = 0
+        self.epoch_fasthit = 0
 
     def set_config(self, dic):
         for (k_i, v_i) in dic.items():
@@ -431,7 +436,7 @@ class FlatController(TimingObj):
             swap_history = [] # stop replicate swappings
             while True:
                 if iteration_cnt > 10: # for debugging
-                    print("iteration more than 10")
+                    print("[warning] iteration more than 10")
                     break
                 hotness_rank_list = self.metasets[set_id].get_hotness_rank()
                 swap_agent = SmartSwap(hotness_rank_list, self.flatmem, set_id)
@@ -484,7 +489,6 @@ class FlatController(TimingObj):
                 self.start_migration(victim_p_address, p_address, self.config["swap_policy"])
 
     def access(self, event):
-        self.access_cnt += 1
         set_id = extract_bit(event.p_addr, addr_set_low, addr_set_bit)
         if not set_id in self.metasets:
             self.metasets[set_id] = MetaCache(set_id, self.flatmem)
@@ -492,11 +496,24 @@ class FlatController(TimingObj):
         self.metasets[set_id].access_trans_cache(event.p_addr)
         # print("cnt: %d granted access %x" % (self.access_cnt, event.p_addr))
 
-        self.flatmem.request(event)
+        in_fast = self.flatmem.request(event)
 
         self.sync_cycle()
         # print("fast cycle:%d slow cycle:%d flat cycle:%d" % (self.flatmem.fastmem.avail_cycle, self.flatmem.slowmem.avail_cycle, self.avail_cycle))
         self.post_access(event)
+
+        access_epoch = 10000
+        if self.access_cnt % access_epoch == 0:
+            if self.access_cnt > 0:
+                epoch_hitrate = 1.0 * self.epoch_fasthit / (self.epoch_slowhit + self.epoch_fasthit)
+                print("access count:%d\tfast access:%d\tslow access:%d\thitrate:%.2f" % (self.access_cnt, self.epoch_fasthit, self.epoch_slowhit, epoch_hitrate))
+            self.epoch_fasthit = 0
+            self.epoch_slowhit = 0
+        if in_fast:
+            self.epoch_fasthit += 1
+        else:
+            self.epoch_slowhit += 1
+        self.access_cnt += 1
 
     def showstats(self):
         print("display all statistics")
