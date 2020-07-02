@@ -195,11 +195,12 @@ class CacheEntry(object):
 
 class LRFURepl(object):
     LRFU_WINDOW = 5
+    LRFU_Lambda = 1
 
     def get_hotness(self, curr_time, lst):
         sum = 0
         for item in lst:
-            sum += 0.5 ** (curr_time - item)
+            sum += (0.5 * self.LRFU_Lambda) ** (curr_time - item)
         return sum
 
 
@@ -215,8 +216,7 @@ class MetaCache(TimingObj):
         if repl_policy == ReplPolicy.LRFU:
             self.lrfu_history = {}
             self.lrfu = LRFURepl()
-
-    entries = {}  # region_id -> hotness
+        self.entries = {}  # region_id -> hotness
     # List of pages. we do not actually duplicate transtable. Use a bool array to cancel latency for cached mapping.
     cached_trans_table = []
 
@@ -252,8 +252,8 @@ class MetaCache(TimingObj):
             self.entries[p_region] = CacheEntry(self.timestamp)
         elif self.repl_policy == ReplPolicy.LRFU:
             # remove out-dated history accesses
-            while (len(self.lrfu_history[p_region]) > 0) and (self.timestamp - self.lrfu_history[p_region][0] > self.lrfu.LRFU_WINDOW):
-                self.lrfu_history[p_region].pop(0)
+            self.lrfu_history[p_region] = self.lrfu_history[p_region][max(len(self.lrfu_history[p_region])-self.lrfu.LRFU_WINDOW, 0):] # only keep the rear WINDOW elements
+            # print(p_region, self.lrfu_history[p_region])
             # append current access
             self.lrfu_history[p_region].append(self.timestamp)
             self.entries[p_region] = CacheEntry(1) # indicating this entry is valid
@@ -482,7 +482,7 @@ class FlatController(TimingObj):
             m_addr2 = self.metasets[set_id].access_trans_cache(p_addr2)
             m_page1 = extract_bit(m_addr1, addr_page_low, addr_page_bit)
             m_page2 = extract_bit(m_addr2, addr_page_low, addr_page_bit)
-            print("[info] p1 %x m1 %x  p2 %x m2 %x" % (p_addr1, m_addr1, p_addr2, m_addr2))
+            # print("[info] swap: p1 %x m1 %x  p2 %x m2 %x" % (p_addr1, m_addr1, p_addr2, m_addr2))
             self.flatmem.trans_table_set(p_page1, m_page2)
             self.flatmem.trans_table_set(p_page2, m_page1)
             # print("[info] migration done", self.flatmem.trans_table)
@@ -627,10 +627,10 @@ class FlatController(TimingObj):
             self.epoch_fasthit = [0] * (self.max_set_id + 1)
             self.epoch_slowhit = [0] * (self.max_set_id + 1)
         if in_fast:
-            if set_id <= self.max_set_id:
+            if set_id < len(self.epoch_fasthit):
                 self.epoch_fasthit[set_id] += 1 # only record limited set hit info
         else:
-            if set_id <= self.max_set_id:
+            if set_id < len(self.epoch_slowhit):
                 self.epoch_slowhit[set_id] += 1
         self.access_cnt += 1
 
