@@ -5,3 +5,5 @@ __pycache__/*
 trace/**
 *.pyc
 result/
+call_run.sh
+trace_in_set1.py
