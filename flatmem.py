@@ -65,7 +65,7 @@ class Memory(TimingObj):
         if event.m_addr > self.capacity:
             print("[Error] Out of %s %x>%x!" %
                   (self.name, event.m_addr, self.capacity))
-            return -1  # out of memory exception
+            exit(-1)  # out of memory exception
         if event.is_write:
             self.avail_cycle = max(
                 self.avail_cycle, event.current_cycle) + self.write_lat
@@ -110,6 +110,8 @@ class FlatMemory(TimingObj):
             flatconfig["slow_cap"], flatconfig["slow_read_lat"], flatconfig["slow_write_lat"], "slowmem")
         self.trans_table_read_lat = flatconfig["fast_read_lat"]
         self.fast_block = flatconfig["fast_block"]
+        self.epoch_trans_hit = 0
+        self.epoch_trans_access = 0
 
     def mpage_in_fastmem(self, maddress):
         region = extract_bit(maddress, addr_region_low -
@@ -194,29 +196,34 @@ class CacheEntry(object):
 
 
 class LRFURepl(object):
-    LRFU_WINDOW = 5
-    LRFU_Lambda = 1
+    LRFU_WINDOW = 10
+    LRFU_Lambda = 1.75
+    LRFU_THRESHOLD = 50
 
     def get_hotness(self, curr_time, lst):
         sum = 0
         for item in lst:
-            sum += (0.5 * self.LRFU_Lambda) ** (curr_time - item)
+            if curr_time - item <= self.LRFU_THRESHOLD:
+                sum += (0.5 * self.LRFU_Lambda) ** (curr_time - item)
         return sum
 
 
 class MetaCache(TimingObj):
     set_id = 0
 
+    def set_repl_policy(self, repl_policy):
+        self.repl_policy = repl_policy
+        if repl_policy == ReplPolicy.LRFU:
+            # fast_region -> [timestamps of history accesses]
+            self.lrfu_history = {}
+            self.lrfu = LRFURepl()
+        self.entries = {}  # region_id -> hotness
+
     def __init__(self, set_id, flatmem, repl_policy):
         self.set_id = set_id
         self.flatmem = flatmem
         self.timestamp = 0  # for ReplPolicy.LRU or ReplPolicy.LRULIP
-        # fast_region -> [timestamps of history accesses]
-        self.repl_policy = repl_policy
-        if repl_policy == ReplPolicy.LRFU:
-            self.lrfu_history = {}
-            self.lrfu = LRFURepl()
-        self.entries = {}  # region_id -> hotness
+        self.set_repl_policy(repl_policy)
     # List of pages. we do not actually duplicate transtable. Use a bool array to cancel latency for cached mapping.
     cached_trans_table = []
 
@@ -241,7 +248,7 @@ class MetaCache(TimingObj):
                 self.lrfu_history[p_region] = []
             elif self.repl_policy == ReplPolicy.Random:
                 self.entries[p_region] = CacheEntry(
-                    random.randint(1, (1 << addr_set_bit) ** 3))
+                    random.randint(1, INF))
         # update existing entry
         if self.repl_policy == ReplPolicy.LFU:
             self.entries[p_region] = CacheEntry(
@@ -277,8 +284,10 @@ class MetaCache(TimingObj):
         # if hit, no latency added
         else:
             self.flatmem.cached_fast_trans_num += 1
+            self.flatmem.epoch_trans_hit += 1
             self.cached_trans_table.remove(p_page)
             self.cached_trans_table.append(p_page)
+        self.flatmem.epoch_trans_access += 1
         return self.flatmem.translate_address(p_addr)
 
     def find_victim(self, event):
@@ -294,6 +303,7 @@ class MetaCache(TimingObj):
                     # print("[debug] region %x timestamp %d hotness %.2f" % (region_id, self.timestamp, hotness))
                 if hotness > INF:
                     print("[warning] hotness over INF")
+                    exit()
                 if hotness < min_hotness:
                     min_hotness = hotness
                     min_hotness_region = region_id
@@ -311,8 +321,8 @@ class MetaCache(TimingObj):
 
 
 flat_config1 = {
-    "fast_cap": 0x1003fff,  # 16KB, 4 blocks * 15 sets
-    "slow_cap": 0x100ffff,  # 128KB, 14 blocks * 15 sets
+    "fast_cap": 0x20f1fff,  # 16KB, 4 blocks * 15 sets
+    "slow_cap": 0x20fffff,  # 128KB, 14 blocks * 15 sets
     "fast_read_lat": 1,
     "fast_write_lat": 1,
     "slow_read_lat": 2,
@@ -340,7 +350,7 @@ flat_config_dram_nvm = {
 
 
 class SmartSwap(object):
-    swap_alpha = 3.0  # benefit of relative rank
+    swap_alpha = 4.0  # benefit of relative rank
     swap_beta = 6  # cost of one migration
     swap_gamma = 1.0  # benefit of one empty slot: 1.0
     slow_mru_region = -1
@@ -478,8 +488,8 @@ class FlatController(TimingObj):
         if swap_policy == SwapPolicy.FastSwap:
             self.gen_swap_event(p_addr1, p_addr2)
             self.fast_swap_swap_cnt += 1
-            m_addr1 = self.metasets[set_id].access_trans_cache(p_addr1)
-            m_addr2 = self.metasets[set_id].access_trans_cache(p_addr2)
+            m_addr1 = self.metasets[set_id].access_trans_cache(p_addr1) # we may not have addr1 translation info (only checked victim states)
+            m_addr2 = self.flatmem.translate_address(p_addr2) # we have addr2 translation info (just accessed)
             m_page1 = extract_bit(m_addr1, addr_page_low, addr_page_bit)
             m_page2 = extract_bit(m_addr2, addr_page_low, addr_page_bit)
             # print("[info] swap: p1 %x m1 %x  p2 %x m2 %x" % (p_addr1, m_addr1, p_addr2, m_addr2))
@@ -490,7 +500,7 @@ class FlatController(TimingObj):
         elif swap_policy == SwapPolicy.SlowSwap:
             # exception: when the challenger was originally in fastmem, swap challenger with trans[challenger]
             if self.flatmem.maddr_in_fastmem(p_addr2):
-                p_addr1 = self.metasets[set_id].access_trans_cache(p_addr2)
+                p_addr1 = self.flatmem.translate_address(p_addr2)
                 p_page1 = extract_bit(p_addr1, addr_page_low, addr_page_bit)
 
             m_addr1 = self.metasets[set_id].access_trans_cache(
@@ -512,7 +522,7 @@ class FlatController(TimingObj):
             self.flatmem.trans_table_set(m_page1, p_page2)
             # print("migration done", self.flatmem.trans_table)
             # print("migration done %x <-> %x <-> %x" % (p_addr1, m_addr1, p_addr2))
-            # assert(len(self.flatmem.trans_table) <= 2 * self.config["fast_block"]) # in slow swap, size of swapped table is always 2*fast_block*set_num
+            assert(len(self.flatmem.trans_table) <= 2 * self.config["fast_block"]) # in slow swap, size of swapped table is always 2*fast_block*set_num
             # in slow swap, all swapping is 2-node circle
             assert(len(self.flatmem.trans_table) % 2 == 0)
         elif swap_policy == SwapPolicy.SmartSwap:
@@ -608,24 +618,31 @@ class FlatController(TimingObj):
                 if self.config["repl_policy"] != ReplPolicy.Sample:
                     epoch_hitrate = 1.0 * sum(self.epoch_fasthit) / \
                         (sum(self.epoch_slowhit) + sum(self.epoch_fasthit))
-                    print("access count:%d\tfast access:%d\tslow access:%d\thitrate:%.2f" % (
-                        self.access_cnt, sum(self.epoch_fasthit), sum(self.epoch_slowhit), epoch_hitrate))
+                    epoch_trans_hitrate = 1.0 * self.flatmem.epoch_trans_hit / self.flatmem.epoch_trans_access
+                    # print("access count:%d\tfast access:%d\tslow access:%d\thitrate:%.2f" % (
+                    #     self.access_cnt, sum(self.epoch_fasthit), sum(self.epoch_slowhit), epoch_hitrate))
+                    # print("%d\t%d" % (self.flatmem.epoch_trans_hit, self.flatmem.epoch_trans_access))
                 else:
                     # display three replacement policies respectively
                     fasthit_n = sum(self.epoch_fasthit[0::3])
                     slowhit_n = sum(self.epoch_slowhit[0::3])
-                    print("[LRU]access count:%d\tfast access:%d\tslow access:%d\thitrate:%.2f" % (
-                        self.access_cnt, sum(self.epoch_fasthit[0::3]), sum(self.epoch_slowhit[0::3]), 1.0 * fasthit_n / (fasthit_n + slowhit_n)))
+                    if fasthit_n + slowhit_n > 0:
+                        print("[LRU]access count:%d\tfast access:%d\tslow access:%d\thitrate:%.2f" % (
+                            self.access_cnt, sum(self.epoch_fasthit[0::3]), sum(self.epoch_slowhit[0::3]), 1.0 * fasthit_n / (fasthit_n + slowhit_n)))
                     fasthit_n = sum(self.epoch_fasthit[1::3])
                     slowhit_n = sum(self.epoch_slowhit[1::3])
-                    print("[LFU]access count:%d\tfast access:%d\tslow access:%d\thitrate:%.2f" % (
-                        self.access_cnt, sum(self.epoch_fasthit[1::3]), sum(self.epoch_slowhit[1::3]), 1.0 * fasthit_n / (fasthit_n + slowhit_n)))
+                    if fasthit_n + slowhit_n > 0:
+                        print("[LFU]access count:%d\tfast access:%d\tslow access:%d\thitrate:%.2f" % (
+                            self.access_cnt, sum(self.epoch_fasthit[1::3]), sum(self.epoch_slowhit[1::3]), 1.0 * fasthit_n / (fasthit_n + slowhit_n)))
                     fasthit_n = sum(self.epoch_fasthit[2::3])
                     slowhit_n = sum(self.epoch_slowhit[2::3])
-                    print("[LRFU]access count:%d\tfast access:%d\tslow access:%d\thitrate:%.2f" % (
-                        self.access_cnt, sum(self.epoch_fasthit[2::3]), sum(self.epoch_slowhit[2::3]), 1.0 * fasthit_n / (fasthit_n + slowhit_n)))
+                    if fasthit_n + slowhit_n > 0:
+                        print("[LRFU]access count:%d\tfast access:%d\tslow access:%d\thitrate:%.2f" % (
+                            self.access_cnt, sum(self.epoch_fasthit[2::3]), sum(self.epoch_slowhit[2::3]), 1.0 * fasthit_n / (fasthit_n + slowhit_n)))
             self.epoch_fasthit = [0] * (self.max_set_id + 1)
             self.epoch_slowhit = [0] * (self.max_set_id + 1)
+            self.flatmem.epoch_trans_hit = 0
+            self.flatmem.epoch_trans_access = 0
         if in_fast:
             if set_id < len(self.epoch_fasthit):
                 self.epoch_fasthit[set_id] += 1 # only record limited set hit info
@@ -637,19 +654,19 @@ class FlatController(TimingObj):
     def showstats(self):
         print("display all statistics")
         if self.config["swap_policy"] == SwapPolicy.SmartSwap:
-            print("smartswap count repl:%d restore:%d" %
+            print("\tsmartswap count repl:%d restore:%d" %
                   (self.smart_swap_repl_cnt, self.smart_swap_restore_cnt))
         elif self.config["swap_policy"] == SwapPolicy.FastSwap:
-            print("fastswap count %d" % (self.fast_swap_swap_cnt))
+            print("\tfastswap count %d" % (self.fast_swap_swap_cnt))
         elif self.config["swap_policy"] == SwapPolicy.SlowSwap:
-            print("slowswap count %d" % (self.slow_swap_swap_cnt))
+            print("\tslowswap count %d" % (self.slow_swap_swap_cnt))
         if self.config["bypass_policy"] == BypassPolicy.Probability:
-            print("bypass probability: %.2f" %
+            print("\tbypass probability: %.2f" %
                   (self.config["bypass_probability"]))
-        print("fast cycle:%d slow cycle:%d flat cycle:%d" % (
+        print("\tfast cycle:%d slow cycle:%d flat cycle:%d" % (
             self.flatmem.fastmem.used_cycle, self.flatmem.slowmem.used_cycle, self.avail_cycle))
-        print("cached fast trans:%d uncached fast trans:%d rate:%.2f" % (self.flatmem.cached_fast_trans_num, self.flatmem.uncached_fast_trans_num,
+        print("\tcached fast trans:%d uncached fast trans:%d rate:%.2f" % (self.flatmem.cached_fast_trans_num, self.flatmem.uncached_fast_trans_num,
                                                                          (self.flatmem.cached_fast_trans_num / (self.flatmem.cached_fast_trans_num + self.flatmem.uncached_fast_trans_num))))
-        print("fast access:%d slow access:%d hitrate:%.2f" % (self.flatmem.fastmem.access_cnt, self.flatmem.slowmem.access_cnt,
+        print("\tfast access:%d slow access:%d hitrate:%.2f" % (self.flatmem.fastmem.access_cnt, self.flatmem.slowmem.access_cnt,
                                                               1.0 * self.flatmem.fastmem.access_cnt / (self.flatmem.fastmem.access_cnt + self.flatmem.slowmem.access_cnt)))
 
